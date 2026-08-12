@@ -14,6 +14,41 @@ use crate::semantic::derive_footguns;
 /// failure matches a known class (`None` otherwise - an unrecognised error is relayed raw, unadorned).
 /// The classes mirror the RFC-0016 §4 table; each is matched off DuckDB's real message text.
 pub fn enrich(raw: &str, query: &str, schema: &[TableSchema]) -> Option<String> {
+    // #433: a sealed segment whose *data region* is corrupt but whose Parquet footer is intact binds
+    // cleanly and then fails at execution, taking the whole query with it. The engine names nothing -
+    // the observed message is `Invalid Error: don't know what type: ` - so an operator cannot tell a
+    // bad file from a bad query. Worse, the two corruption classes read as unrelated problems: a
+    // footer-corrupt segment fails `prepare`, so #430 drops it and quietly reduces the table, while
+    // this one binds and dies at execution with a message that points nowhere.
+    //
+    // Deliberately without an integrity scan here. Hashing the nest's segments would name the exact
+    // file, but it would also put an unbounded, caller-triggered sweep on the query path - the cost
+    // bound #476 and #478 are already about, reachable by anyone who can send a query. The startup
+    // pass (`seal::verify_and_quarantine`, run from `build_nest`) already hashes every segment and
+    // quarantines the mismatch; it catches this class, and the gap is only the window between
+    // restarts. So name the class, name the tables whose segments to suspect, and point at the pass
+    // that can identify the file. Note `nuthatch doctor` is *not* that pass - only a restart is.
+    if raw.contains("don't know what type:") {
+        let touched: Vec<&str> = schema
+            .iter()
+            .map(|t| t.table.as_str())
+            .filter(|t| contains_word(query, t))
+            .collect();
+        let which = match touched.as_slice() {
+            [] => "a sealed segment behind this query".to_string(),
+            [one] => format!("a sealed segment of `{one}`"),
+            many => format!("a sealed segment of one of `{}`", many.join("`, `")),
+        };
+        return Some(format!(
+            "{which} binds but cannot be read - its Parquet footer is intact, so the view built over \
+             it and the failure landed at execution instead. This is a corrupt file on disk, not a \
+             problem with your query: re-running it unchanged fails the same way. Restart the nest - \
+             the startup integrity pass hashes every segment against the manifest, quarantines the \
+             one that no longer matches and names it in the log, after which this table serves the \
+             rows that remain."
+        ));
+    }
+
     // Unknown table: `Catalog Error: Table with name <X> does not exist!`
     if let Some(name) = between(raw, "Table with name ", " does not exist") {
         let name = name.trim();
@@ -261,6 +296,47 @@ mod tests {
                 },
             ],
         }]
+    }
+
+    /// #433: the page-corrupt-segment failure. Reproduced there by overwriting a sealed segment's
+    /// data region and leaving its footer intact, which yields exactly this message - `prepare`
+    /// succeeds, `CREATE VIEW` succeeds, and execution dies naming nothing.
+    #[test]
+    fn a_page_corrupt_segment_is_named_as_a_bad_file_not_a_bad_query() {
+        let raw = "Invalid Error: don't know what type: : Error code 1: Unknown error code";
+        let hint = enrich(raw, "SELECT count(*) FROM usdc__transfer", &schema()).unwrap();
+        // Names the table whose segments to suspect.
+        assert!(
+            hint.contains("usdc__transfer"),
+            "must name the queried table: {hint}"
+        );
+        // Says whose fault it is. The operator's next move differs entirely from a bad query.
+        assert!(
+            hint.contains("corrupt file on disk"),
+            "must say this is a file, not a query: {hint}"
+        );
+        assert!(
+            hint.contains("Restart"),
+            "must point at the pass that identifies the file: {hint}"
+        );
+        // `doctor` does not run `verify_and_quarantine` - only `build_nest` does - so it must not be
+        // offered as the remedy.
+        assert!(
+            !hint.contains("doctor"),
+            "must not recommend a command that does not run the integrity pass: {hint}"
+        );
+    }
+
+    /// A query naming no known table still gets the class, without inventing a table name.
+    #[test]
+    fn a_page_corrupt_segment_hint_survives_an_unrecognised_query() {
+        let raw = "Invalid Error: don't know what type: ";
+        let hint = enrich(raw, "SELECT 1", &schema()).unwrap();
+        assert!(
+            hint.contains("a sealed segment behind this query"),
+            "{hint}"
+        );
+        assert!(!hint.contains("usdc__transfer"), "invents no table: {hint}");
     }
 
     #[test]
