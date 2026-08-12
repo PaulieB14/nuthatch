@@ -14,41 +14,6 @@ use crate::semantic::derive_footguns;
 /// failure matches a known class (`None` otherwise - an unrecognised error is relayed raw, unadorned).
 /// The classes mirror the RFC-0016 §4 table; each is matched off DuckDB's real message text.
 pub fn enrich(raw: &str, query: &str, schema: &[TableSchema]) -> Option<String> {
-    // #433: a sealed segment whose *data region* is corrupt but whose Parquet footer is intact binds
-    // cleanly and then fails at execution, taking the whole query with it. The engine names nothing -
-    // the observed message is `Invalid Error: don't know what type: ` - so an operator cannot tell a
-    // bad file from a bad query. Worse, the two corruption classes read as unrelated problems: a
-    // footer-corrupt segment fails `prepare`, so #430 drops it and quietly reduces the table, while
-    // this one binds and dies at execution with a message that points nowhere.
-    //
-    // Deliberately without an integrity scan here. Hashing the nest's segments would name the exact
-    // file, but it would also put an unbounded, caller-triggered sweep on the query path - the cost
-    // bound #476 and #478 are already about, reachable by anyone who can send a query. The startup
-    // pass (`seal::verify_and_quarantine`, run from `build_nest`) already hashes every segment and
-    // quarantines the mismatch; it catches this class, and the gap is only the window between
-    // restarts. So name the class, name the tables whose segments to suspect, and point at the pass
-    // that can identify the file. Note `nuthatch doctor` is *not* that pass - only a restart is.
-    if raw.contains("don't know what type:") {
-        let touched: Vec<&str> = schema
-            .iter()
-            .map(|t| t.table.as_str())
-            .filter(|t| contains_word(query, t))
-            .collect();
-        let which = match touched.as_slice() {
-            [] => "a sealed segment behind this query".to_string(),
-            [one] => format!("a sealed segment of `{one}`"),
-            many => format!("a sealed segment of one of `{}`", many.join("`, `")),
-        };
-        return Some(format!(
-            "{which} binds but cannot be read - its Parquet footer is intact, so the view built over \
-             it and the failure landed at execution instead. This is a corrupt file on disk, not a \
-             problem with your query: re-running it unchanged fails the same way. Restart the nest - \
-             the startup integrity pass hashes every segment against the manifest, quarantines the \
-             one that no longer matches and names it in the log, after which this table serves the \
-             rows that remain."
-        ));
-    }
-
     // Unknown table: `Catalog Error: Table with name <X> does not exist!`
     if let Some(name) = between(raw, "Table with name ", " does not exist") {
         let name = name.trim();
@@ -132,6 +97,51 @@ pub fn enrich(raw: &str, query: &str, schema: &[TableSchema]) -> Option<String> 
                 }
             }
         }
+    }
+
+    // #433: a sealed segment whose *data region* is corrupt but whose Parquet footer is intact binds
+    // cleanly and then fails at execution, taking the whole query with it. The engine names nothing -
+    // the observed message is `Invalid Error: don't know what type: ` - so an operator cannot tell a
+    // bad file from a bad query. Worse, the two corruption classes read as unrelated problems: a
+    // footer-corrupt segment fails `prepare`, so #430 drops it and quietly reduces the table, while
+    // this one binds and dies at execution pointing nowhere.
+    //
+    // **Matched last, and on the engine-prefixed form only.** DuckDB echoes the caller's own text
+    // back in binder errors, so a bare substring test against `raw` is a test against attacker input:
+    // `SELECT "don't know what type: " FROM t` produces a `Binder Error` carrying the phrase, and an
+    // eager match here would tell an operator their healthy nest holds a corrupt file *and* shadow
+    // the "no column" hint that query actually wanted. Running after the precise classifiers means
+    // the specific hint always wins; requiring `Invalid Error:` means the phrase alone is not enough.
+    //
+    // Deliberately without an integrity scan. Hashing the nest's segments would name the exact file,
+    // but it would put an unbounded, caller-triggered sweep on the query path - the cost bound #476
+    // and #478 are already about, reachable by anyone who can send a query.
+    if raw.contains("Invalid Error: don't know what type:") {
+        // Case-folded, like the sibling `mentions_unquoted`: DuckDB resolves unquoted identifiers
+        // case-insensitively, so `FROM USDC__Transfer` is a valid way to name `usdc__transfer`, and
+        // failing to fold here would drop the table name - the exact "names nothing" complaint #433
+        // was filed about.
+        let lowered = query.to_ascii_lowercase();
+        let touched: Vec<&str> = schema
+            .iter()
+            .map(|t| t.table.as_str())
+            .filter(|t| contains_word(&lowered, &t.to_ascii_lowercase()))
+            .collect();
+        let which = match touched.as_slice() {
+            [] => "a sealed segment behind this query".to_string(),
+            [one] => format!("a sealed segment of `{one}`"),
+            many => format!("a sealed segment of one of `{}`", many.join("`, `")),
+        };
+        return Some(format!(
+            "{which} binds but cannot be read - its Parquet footer is intact, so the view built over \
+             it and the failure landed at execution instead. This is a corrupt file on disk, not a \
+             problem with your query: re-running it unchanged fails the same way. Restart the nest \
+             and the startup integrity pass hashes every segment against the manifest. A segment in \
+             this nest's own directory is quarantined and the table then serves the rows that \
+             remain; a segment in a runtime's *shared* store is reported in the log and deliberately \
+             left in place, because other datasets reference those bytes (RFC-0033 §11a) - that one \
+             is yours to remove once you know what else it feeds."
+        ));
     }
 
     None
@@ -324,6 +334,47 @@ mod tests {
         assert!(
             !hint.contains("doctor"),
             "must not recommend a command that does not run the integrity pass: {hint}"
+        );
+        // And the remedy must not over-promise: `verify_and_quarantine` deliberately refuses to
+        // quarantine a segment in a runtime's shared store (RFC-0033 §11a), so telling every
+        // operator that restarting clears it would be a restart loop for anyone on that layout.
+        assert!(
+            hint.contains("shared"),
+            "must say the shared-store case is not auto-quarantined: {hint}"
+        );
+    }
+
+    /// The classifier must not fire on the caller's own text. DuckDB echoes query text back in binder
+    /// errors, so a bare substring match would let anyone who can send a query make a healthy nest
+    /// report a corrupt file - and would shadow the hint the query actually needed.
+    #[test]
+    fn a_query_echoing_the_phrase_is_not_reported_as_a_corrupt_file() {
+        let raw =
+            r#"Binder Error: Referenced column "don't know what type: " not found in FROM clause!"#;
+        let hint = enrich(
+            raw,
+            r#"SELECT "don't know what type: " FROM usdc__transfer"#,
+            &schema(),
+        )
+        .unwrap();
+        assert!(
+            !hint.contains("corrupt file on disk"),
+            "a binder error must not be read as segment corruption: {hint}"
+        );
+        assert!(
+            hint.contains("no column"),
+            "and the precise classifier must still win: {hint}"
+        );
+    }
+
+    /// DuckDB resolves unquoted identifiers case-insensitively, so the table must still be named.
+    #[test]
+    fn the_corrupt_segment_hint_names_the_table_whatever_its_casing() {
+        let raw = "Invalid Error: don't know what type: ";
+        let hint = enrich(raw, "SELECT count(*) FROM USDC__Transfer", &schema()).unwrap();
+        assert!(
+            hint.contains("`usdc__transfer`"),
+            "must fold case before matching table names: {hint}"
         );
     }
 
